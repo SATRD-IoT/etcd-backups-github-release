@@ -1,0 +1,60 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etcd-backup
+spec:
+  schedule: "0 3 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  concurrencyPolicy: Allow
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: etcd-backup
+            image: ravaga/etcd-backup:v3.5.13
+            env:
+            - name: ETCDCTL_API
+              value: "3"
+            - name: ETCDCTL_ENDPOINTS
+              value: "https://127.0.0.1:2379"
+            - name: ETCDCTL_CACERT
+              value: "/etc/kubernetes/pki/etcd/ca.crt"
+            - name: ETCDCTL_CERT
+              value: "/etc/kubernetes/pki/etcd/healthcheck-client.crt"
+            - name: ETCDCTL_KEY
+              value: "/etc/kubernetes/pki/etcd/healthcheck-client.key"
+            command: ["/bin/bash","-c"]
+            args: ["etcdctl snapshot save /data/etcd-backup/etcd-snapshot-$(date +%Y-%m-%dT%H:%M).db"]
+            volumeMounts:
+            - mountPath: /etc/kubernetes/pki/etcd
+              name: etcd-certs
+              readOnly: true
+            - mountPath: /data/etcd-backup
+              name: etcd-backup
+          restartPolicy: OnFailure
+          hostNetwork: true
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                    - key: node-role.kubernetes.io/control-plane
+                      operator: Exists
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              effect: NoSchedule
+              operator: Exists
+            - key: node.kubernetes.io/memory-pressure
+              effect: NoSchedule
+              operator: Exists
+          volumes:
+          - name: etcd-certs
+            hostPath:
+              path: /etc/kubernetes/pki/etcd
+              type: Directory
+          - name: etcd-backup
+            hostPath:
+              path: /data/etcd-backup
+              type: DirectoryOrCreate
