@@ -1,0 +1,13 @@
+.git
+.gitignore
+.github
+README.md
+LICENSE
+k8s/
+local-backups/
+*.db
+*.db.gz
+*.age
+*.sha256
+*.metadata.txt
+*.snapshot-status.txt

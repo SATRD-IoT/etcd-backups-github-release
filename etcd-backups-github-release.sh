@@ -1,53 +1,36 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+umask 077
+
 # =========================
 # Configuration
 # =========================
 
-# GitHub target repo and release tag
-export GH_TOKEN="<github-personal-access-token>"
-GITHUB_REPO="<github-repository-to-store-etcd-backups-in-releases>"
-RELEASE_TAG="<release-tag>"
+# Required:
+#   GH_TOKEN must be exported in the environment or gh must already be authenticated.
+#
+# Optional environment overrides:
+#   GITHUB_REPO, RELEASE_TAG, KEEP_REMOTE, WORK_DIR, LOCK_FILE, DRY_RUN
+#   ENABLE_AGE_ENCRYPTION, AGE_RECIPIENT
+#   ETCD_ENDPOINT, ETCD_CACERT, ETCD_CERT, ETCD_KEY
 
-# How many backups to keep remotely
-KEEP_REMOTE=7
+GITHUB_REPO="${GITHUB_REPO:-your-github-repo/clusters-backups}"
+RELEASE_TAG="${RELEASE_TAG:-your-cluster}"
+KEEP_REMOTE="${KEEP_REMOTE:-7}"
+WORK_DIR="${WORK_DIR:-/data/etcd-backup}"
+LOCK_FILE="${LOCK_FILE:-/var/lock/etcd-github-backup.lock}"
+DRY_RUN="${DRY_RUN:-false}"
 
-# Local working directory
-WORK_DIR="/data/etcd-backup"
-TMP_DIR="${WORK_DIR}/tmp" #/tmp
-
-# Snapshot naming
-HOSTNAME_SHORT="$(hostname -s)"
-TS="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
-BASENAME="etcd-${HOSTNAME_SHORT}-${TS}"
-
-# Output files
-SNAPSHOT_DB="${TMP_DIR}/${BASENAME}.db"
-# SNAPSHOT_TGZ="${TMP_DIR}/${BASENAME}.db.tar.gz"
-SNAPSHOT_GZ="${SNAPSHOT_DB}.gz"
-# CHECKSUM_FILE="${TMP_DIR}/${BASENAME}.db.tar.gz.sha256"
-CHECKSUM_FILE="${TMP_DIR}/${BASENAME}.gz.sha256"
-METADATA_FILE="${TMP_DIR}/${BASENAME}.metadata.txt"
-
-# Optional encryption with age
-# Set to "true" to enable encryption
-ENABLE_AGE_ENCRYPTION="false"
-
+ENABLE_AGE_ENCRYPTION="${ENABLE_AGE_ENCRYPTION:-false}"
 # Public key generated with: age-keygen -o key.txt
-# Public key looks like: age1...
-AGE_RECIPIENT="<public-age-key-for-encryption>"
+AGE_RECIPIENT="${AGE_RECIPIENT:-}"
 
-# If encryption enabled:
-ENCRYPTED_FILE="${SNAPSHOT_TGZ}.age"
-ENCRYPTED_CHECKSUM_FILE="${ENCRYPTED_FILE}.sha256"
-
-# etcdctl access
 export ETCDCTL_API=3
-ETCD_ENDPOINT="https://127.0.0.1:2379"
-ETCD_CACERT="/etc/kubernetes/pki/etcd/ca.crt"
-ETCD_CERT="/etc/kubernetes/pki/etcd/server.crt"
-ETCD_KEY="/etc/kubernetes/pki/etcd/server.key"
+ETCD_ENDPOINT="${ETCD_ENDPOINT:-https://127.0.0.1:2379}"
+ETCD_CACERT="${ETCD_CACERT:-/etc/kubernetes/pki/etcd/ca.crt}"
+ETCD_CERT="${ETCD_CERT:-/etc/kubernetes/pki/etcd/server.crt}"
+ETCD_KEY="${ETCD_KEY:-/etc/kubernetes/pki/etcd/server.key}"
 
 # =========================
 # Helpers
@@ -57,40 +40,84 @@ log() {
   printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
 }
 
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
 need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "ERROR: required command not found: $1" >&2
-    exit 1
-  }
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+is_true() {
+  [[ "${1,,}" == "true" || "${1}" == "1" || "${1,,}" == "yes" ]]
 }
 
 cleanup() {
-  rm -rf "${TMP_DIR}"
+  if [[ -n "${TMP_DIR:-}" && -d "${TMP_DIR}" && "${TMP_DIR}" == "${WORK_DIR}"/tmp.* ]]; then
+    rm -rf -- "${TMP_DIR}"
+  fi
 }
 trap cleanup EXIT
+
+run_github_write() {
+  if is_true "${DRY_RUN}"; then
+    log "DRY_RUN: $*"
+    return 0
+  fi
+
+  "$@"
+}
 
 # =========================
 # Pre-flight checks
 # =========================
 
 need_cmd etcdctl
-need_cmd tar
+need_cmd etcdutl
+need_cmd flock
 need_cmd gzip
 need_cmd sha256sum
+need_cmd tee
 need_cmd gh
-need_cmd jq
 
-if [[ "${ENABLE_AGE_ENCRYPTION}" == "true" ]]; then
+if is_true "${ENABLE_AGE_ENCRYPTION}"; then
   need_cmd age
+  [[ -n "${AGE_RECIPIENT}" ]] || die "AGE_RECIPIENT must be set when ENABLE_AGE_ENCRYPTION=true"
+  [[ "${AGE_RECIPIENT}" == age1* ]] || die "AGE_RECIPIENT must be an age public recipient that starts with age1"
 fi
 
-mkdir -p "${TMP_DIR}"
+[[ "${KEEP_REMOTE}" =~ ^[0-9]+$ ]] || die "KEEP_REMOTE must be a non-negative integer"
+(( KEEP_REMOTE > 0 )) || die "KEEP_REMOTE must be greater than 0"
 
-# Verify gh auth works
-gh auth status >/dev/null 2>&1 || {
-  echo "ERROR: gh is not authenticated. Run: gh auth login" >&2
-  exit 1
-}
+mkdir -p -- "${WORK_DIR}"
+if [[ -n "${GH_CONFIG_DIR:-}" ]]; then
+  mkdir -p -- "${GH_CONFIG_DIR}"
+fi
+if [[ "${LOCK_FILE}" == */* ]]; then
+  mkdir -p -- "${LOCK_FILE%/*}"
+fi
+exec 9>"${LOCK_FILE}"
+flock -n 9 || die "backup already running; lock is held at ${LOCK_FILE}"
+
+TMP_DIR="$(mktemp -d "${WORK_DIR}/tmp.XXXXXXXXXX")"
+HOSTNAME_SHORT="$(hostname -s)"
+TS="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+BASENAME="etcd-${HOSTNAME_SHORT}-${TS}"
+
+SNAPSHOT_DB="${TMP_DIR}/${BASENAME}.db"
+SNAPSHOT_GZ="${SNAPSHOT_DB}.gz"
+CHECKSUM_FILE="${TMP_DIR}/${BASENAME}.db.gz.sha256"
+METADATA_FILE="${TMP_DIR}/${BASENAME}.metadata.txt"
+SNAPSHOT_STATUS_FILE="${TMP_DIR}/${BASENAME}.snapshot-status.txt"
+ENCRYPTED_FILE="${SNAPSHOT_GZ}.age"
+ENCRYPTED_CHECKSUM_FILE="${ENCRYPTED_FILE}.sha256"
+
+if [[ -n "${GH_TOKEN:-}" ]]; then
+  export GH_TOKEN
+fi
+
+gh auth status >/dev/null 2>&1 || die "gh is not authenticated. Export GH_TOKEN or run: gh auth login"
 
 # =========================
 # Ensure release exists
@@ -99,9 +126,9 @@ gh auth status >/dev/null 2>&1 || {
 ensure_release() {
   if ! gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPO}" >/dev/null 2>&1; then
     log "Release ${RELEASE_TAG} does not exist. Creating it..."
-    gh release create "${RELEASE_TAG}" \
+    run_github_write gh release create "${RELEASE_TAG}" \
       --repo "${GITHUB_REPO}" \
-      --title "etcd backups" \
+      --title "${RELEASE_TAG}" \
       --notes "Rolling etcd backup assets" \
       >/dev/null
   fi
@@ -112,8 +139,15 @@ ensure_release() {
 # =========================
 
 create_snapshot() {
-  log "Creating etcd snapshot: ${SNAPSHOT_DB}"
+  log "Checking etcd endpoint health"
+  etcdctl \
+    --endpoints="${ETCD_ENDPOINT}" \
+    --cacert="${ETCD_CACERT}" \
+    --cert="${ETCD_CERT}" \
+    --key="${ETCD_KEY}" \
+    endpoint health
 
+  log "Creating etcd snapshot: ${SNAPSHOT_DB}"
   etcdctl \
     --endpoints="${ETCD_ENDPOINT}" \
     --cacert="${ETCD_CACERT}" \
@@ -122,21 +156,35 @@ create_snapshot() {
     snapshot save "${SNAPSHOT_DB}"
 
   log "Verifying snapshot status"
-  etcdutl snapshot status "${SNAPSHOT_DB}" -w table
+  etcdutl snapshot status "${SNAPSHOT_DB}" -w table | tee "${SNAPSHOT_STATUS_FILE}"
 }
 
 # =========================
 # Package and checksum
 # =========================
 
+write_checksum() {
+  local file_path="$1"
+  local checksum_path="$2"
+
+  (
+    cd "${TMP_DIR}"
+    sha256sum "$(basename "${file_path}")" > "$(basename "${checksum_path}")"
+  )
+}
+
 package_snapshot() {
+  local encrypted="false"
+
+  if is_true "${ENABLE_AGE_ENCRYPTION}"; then
+    encrypted="true"
+  fi
+
   log "Compressing snapshot"
-  # tar -C "${TMP_DIR}" -czf "${SNAPSHOT_TGZ}" "$(basename "${SNAPSHOT_DB}")"
   gzip -9 "${SNAPSHOT_DB}"
 
   log "Creating checksum"
-  # sha256sum "${SNAPSHOT_TGZ}" > "${CHECKSUM_FILE}"
-  sha256sum "${SNAPSHOT_GZ}" > "${CHECKSUM_FILE}"
+  write_checksum "${SNAPSHOT_GZ}" "${CHECKSUM_FILE}"
 
   log "Writing metadata"
   cat > "${METADATA_FILE}" <<EOF
@@ -147,6 +195,8 @@ release_tag=${RELEASE_TAG}
 etcd_endpoint=${ETCD_ENDPOINT}
 snapshot_file=$(basename "${SNAPSHOT_GZ}")
 checksum_file=$(basename "${CHECKSUM_FILE}")
+encrypted=${encrypted}
+snapshot_status_file=$(basename "${SNAPSHOT_STATUS_FILE}")
 EOF
 }
 
@@ -155,11 +205,15 @@ EOF
 # =========================
 
 encrypt_if_enabled() {
-  if [[ "${ENABLE_AGE_ENCRYPTION}" == "true" ]]; then
+  if is_true "${ENABLE_AGE_ENCRYPTION}"; then
     log "Encrypting backup with age"
-    # age -r "${AGE_RECIPIENT}" -o "${ENCRYPTED_FILE}" "${SNAPSHOT_TGZ}"
     age -r "${AGE_RECIPIENT}" -o "${ENCRYPTED_FILE}" "${SNAPSHOT_GZ}"
-    sha256sum "${ENCRYPTED_FILE}" > "${ENCRYPTED_CHECKSUM_FILE}"
+    write_checksum "${ENCRYPTED_FILE}" "${ENCRYPTED_CHECKSUM_FILE}"
+
+    cat >> "${METADATA_FILE}" <<EOF
+encrypted_file=$(basename "${ENCRYPTED_FILE}")
+encrypted_checksum_file=$(basename "${ENCRYPTED_CHECKSUM_FILE}")
+EOF
   fi
 }
 
@@ -170,18 +224,20 @@ encrypt_if_enabled() {
 upload_assets() {
   log "Uploading assets to GitHub release ${RELEASE_TAG}"
 
-  if [[ "${ENABLE_AGE_ENCRYPTION}" == "true" ]]; then
-    gh release upload "${RELEASE_TAG}" \
+  if is_true "${ENABLE_AGE_ENCRYPTION}"; then
+    run_github_write gh release upload "${RELEASE_TAG}" \
       "${ENCRYPTED_FILE}" \
       "${ENCRYPTED_CHECKSUM_FILE}" \
       "${METADATA_FILE}" \
+      "${SNAPSHOT_STATUS_FILE}" \
       --repo "${GITHUB_REPO}" \
       --clobber
   else
-    gh release upload "${RELEASE_TAG}" \
+    run_github_write gh release upload "${RELEASE_TAG}" \
       "${SNAPSHOT_GZ}" \
       "${CHECKSUM_FILE}" \
       "${METADATA_FILE}" \
+      "${SNAPSHOT_STATUS_FILE}" \
       --repo "${GITHUB_REPO}" \
       --clobber
   fi
@@ -191,51 +247,79 @@ upload_assets() {
 # Prune old assets
 # =========================
 
+metadata_to_group_record() {
+  local name="$1"
+  local group timestamp host
+
+  [[ "${name}" == *.metadata.txt ]] || return 0
+
+  group="${name%.metadata.txt}"
+  if [[ "${group}" =~ ^etcd-(.*)-([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    timestamp="${BASH_REMATCH[2]}"
+    printf '%s\t%s\t%s\n' "${host}" "${timestamp}" "${group}"
+  fi
+}
+
 prune_old_assets() {
-  log "Pruning old assets, keeping latest ${KEEP_REMOTE} backups"
+  log "Pruning old assets, keeping latest ${KEEP_REMOTE} backup sets per cluster"
 
-  # We group assets by backup prefix, derived from metadata filenames:
-  #   etcd-host-2026-03-12T02-00-00Z.metadata.txt
-  #
-  # Then we sort groups newest-first by the embedded timestamp in the basename.
-
-  local assets_json
-  assets_json="$(gh release view "${RELEASE_TAG}" \
+  local asset_output
+  if ! asset_output="$(gh release view "${RELEASE_TAG}" \
     --repo "${GITHUB_REPO}" \
     --json assets \
-    --jq '.assets[].name')"
+    --jq '.assets[].name')"; then
+    if is_true "${DRY_RUN}"; then
+      log "DRY_RUN: release assets are unavailable; skipping prune"
+      return 0
+    fi
 
-  # Build unique backup groups from metadata files only
-  mapfile -t groups < <(
-    printf '%s\n' "${assets_json}" \
-      | sed 's/^"//; s/"$//' \
-      | grep '\.metadata\.txt$' \
-      | sed 's/\.metadata\.txt$//' \
-      | sort -r
-  )
-
-  local total_groups="${#groups[@]}"
-  if (( total_groups <= KEEP_REMOTE )); then
-    log "Nothing to prune (${total_groups} backup sets present)"
-    return 0
+    die "failed to list release assets for ${RELEASE_TAG}"
   fi
 
-  for (( i=KEEP_REMOTE; i<total_groups; i++ )); do
-    local group="${groups[$i]}"
-    log "Deleting old backup set: ${group}"
+  local assets
+  mapfile -t assets <<< "${asset_output}"
 
-    # Delete matching assets for that group
-    while IFS= read -r asset_name; do
-      [[ -z "${asset_name}" ]] && continue
-      gh release delete-asset "${RELEASE_TAG}" "${asset_name}" \
-        --repo "${GITHUB_REPO}" \
-        --yes
-    done < <(
-      printf '%s\n' "${assets_json}" \
-        | sed 's/^"//; s/"$//' \
-        | grep "^${group}\."
-    )
-  done
+  local records
+  records="$(
+    for asset_name in "${assets[@]}"; do
+      metadata_to_group_record "${asset_name}"
+    done | sort -t $'\t' -k1,1 -k2,2r
+  )"
+
+  [[ -n "${records}" ]] || {
+    log "No backup metadata assets found"
+    return 0
+  }
+
+  declare -A seen_by_host=()
+  local host timestamp group count asset_name deleted_any=false
+
+  while IFS=$'\t' read -r host timestamp group; do
+    [[ -n "${host}" && -n "${timestamp}" && -n "${group}" ]] || continue
+
+    count="${seen_by_host[${host}]:-0}"
+    count=$((count + 1))
+    seen_by_host["${host}"]="${count}"
+
+    if (( count <= KEEP_REMOTE )); then
+      continue
+    fi
+
+    deleted_any=true
+    log "Deleting old backup set for ${host}: ${group}"
+    for asset_name in "${assets[@]}"; do
+      if [[ "${asset_name}" == "${group}".* ]]; then
+        run_github_write gh release delete-asset "${RELEASE_TAG}" "${asset_name}" \
+          --repo "${GITHUB_REPO}" \
+          --yes
+      fi
+    done
+  done <<< "${records}"
+
+  if [[ "${deleted_any}" == "false" ]]; then
+    log "Nothing to prune"
+  fi
 }
 
 # =========================
