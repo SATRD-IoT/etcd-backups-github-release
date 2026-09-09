@@ -21,7 +21,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: etcd-github-backup
-          image: satrd-iot/etcd-backups-github-release:1.0.0
+          image: ghcr.io/satrd-iot/etcd-backups-github-release
           imagePullPolicy: IfNotPresent
           env:
             - name: GH_TOKEN
