@@ -293,6 +293,18 @@ mv /var/lib/etcd /var/lib/etcd.bak
 
 4. Download the selected backup assets from the GitHub release.
 
+You can download it manually, but it's recommended to use the provided script to download an asset from a GitHub release. Set `GH_TOKEN` to a token with access to the etcd backups repository, then pass the repository owner, repository name, release tag, and exact asset filename. The optional fifth argument sets the output path; otherwise, the asset is saved with its original filename. The script requires `wget` and `jq`.
+
+```bash
+export GH_TOKEN="YOUR_GITHUB_TOKEN"
+./download-etcd-backup-from-github-release.sh \
+  "OWNER" \
+  "REPOSITORY" \
+  "RELEASE_TAG" \
+  "ASSET_FILENAME" \
+  ["OUTPUT_PATH"]
+```
+
 For an unencrypted backup, verify and decompress the snapshot:
 
 ```bash

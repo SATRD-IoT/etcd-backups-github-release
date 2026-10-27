@@ -13,7 +13,7 @@ spec:
         spec:
           containers:
           - name: etcd-backup
-            image: ravaga/etcd-backup:v3.5.13
+            image: ghcr.io/satrd-iot/etcd-backups-local
             env:
             - name: ETCDCTL_API
               value: "3"
